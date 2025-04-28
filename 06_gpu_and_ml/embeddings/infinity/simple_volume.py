@@ -6,10 +6,11 @@
 # using the [Infinity inference engine](https://github.com/michaelfeil/infinity "github/michaelfeil/infinity").
 
 # Import everything we need for the locally-run Python (everything in our local_entrypoint function at the bottom).
-from time import time as clock
+import time
 from pathlib import Path
 from more_itertools import chunked
-import csv
+from modal.volume import FileEntry
+import concurrent.futures
 
 import modal
 
@@ -25,9 +26,9 @@ local_logfile.parent.mkdir(parents=True, exist_ok=True)
 # * `max_concurrency` sets the [@modal.concurrent(max_inputs:int) ](https://modal.com/docs/guide/concurrent-inputs#input-concurrency "Modal: input concurrency") argument for the inference app. 
 # This takes advantage of the asynchronous nature of the Infinity embedding inference app.
 # * `gpu` is a string specifying the GPU to be used. 
-batch_size: int = 10
-max_concurrency: int = 1000
-gpu: str = "H200"
+batch_size: int = 100
+max_concurrency: int = 10
+gpu: str = "H100"
 max_containers: int = 1
 # This `max_ims` parameter simply caps the total number of images that are parsed (for testing/debugging).
 # Set to -1 to parse all.
@@ -36,7 +37,7 @@ max_ims: int = 1000
 # This should point to a model on huggingface that is supported by Infinity.
 # Note that your specifically chosen model might require specialized imports when
 # designing the image!
-MODEL_NAME = "openai/clip-vit-base-patch16"
+MODEL_NAME = "openai/clip-vit-base-patch16" # 599 MB
 
 # ## Define the image and data volume
 # Setup the image
@@ -45,13 +46,13 @@ simple_image = (
     .pip_install(["infinity_emb[all]==0.0.76",   # for Infinity inference lib
                   "sentencepiece",               # for this particular chosen model
                   "more-itertools"])             # for elegant list batching
-    .env({"INFINITY_MODEL_ID": MODEL_NAME})      # for Infinity inference lib
+    .env({"INFINITY_MODEL_ID": MODEL_NAME, "HF_HOME": "/data"})      # for Infinity inference lib
 )
 
 # Setup a [Modal Volume](https://modal.com/docs/guide/volumes#volumes "Modal.Volume") containing all of the images we want to encode.
 vol_name = "sweet-coral-db-20k"
 vol_mnt = Path("/data")
-vol = modal.Volume.from_name(vol_name)
+vol = modal.Volume.from_name(vol_name, environment_name="ben-dev")
 
 # Initialize the app
 app = modal.App('vol-simple-infinity', image=simple_image, volumes={vol_mnt: vol})
@@ -72,36 +73,67 @@ class InfinityModel:
     # The enter* decorator
     @modal.enter()
     async def enter(self):
-        self.model = AsyncEmbeddingEngine.from_args(EngineArgs(
+        # self.model = AsyncEmbeddingEngine.from_args(EngineArgs(
+        #         model_name_or_path=MODEL_NAME,
+        #         batch_size=batch_size,
+        #         model_warmup=False,
+        #         engine=InferenceEngine.torch,
+        #         dtype=Dtype.float16,
+        #     ))
+        # await self.model.astart()
+        pass
+    # TODO: get the ecit funcvtion
+
+    @modal.method()
+    async def embed(self, images: list[FileEntry])->list[int]:
+        start_engine = time.perf_counter()
+        model = AsyncEmbeddingEngine.from_args(EngineArgs(
                 model_name_or_path=MODEL_NAME,
                 batch_size=batch_size,
                 model_warmup=False,
                 engine=InferenceEngine.torch,
                 dtype=Dtype.float16,
-                ))
-        await self.model.astart()
-    # TODO: get the ecit funcvtion
+            ))
+        await model.astart()
+        stop_engine = time.perf_counter()
+        elapsed_engine = stop_engine - start_engine
+        print(f"starting engine took => {elapsed_engine:.3f}s")
 
-    @modal.method()
-    async def embed(self, images: list[str])->list[int]:
-        # Convert to a list of volume paths
-        start = clock()
+        start_total = time.perf_counter()
 
-        images = images if isinstance(images, list) else [images]
-        images = [getattr(im, "path", im) for im in images]
-        # File paths to images
-        images = [Image.open(vol_mnt / impath) for impath in images]
+        # Read images from disk    
+        start_read = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            full_paths = [vol_mnt / impath.path for impath in images]
+            images = list(executor.map(Image.open, full_paths))
+        
+        stop_read = time.perf_counter()
+        elapsed_read = stop_read - start_read
+        print(f"read took => {elapsed_read:.3f}s")
 
-        embedding, _ = await self.model.image_embed(images=images)
-        return clock()-start
+        # Embed images
+        start_embed = time.perf_counter()
+        _, _ = await model.image_embed(images=images)
+    
+        stop_embed = time.perf_counter()
+        elapsed_embed = stop_embed - start_embed
+        print(f"engine perf batch={len(images)} elapsed={elapsed_embed:.3f}s")
+
+        stop_total = time.perf_counter()
+        elapsed_total = stop_total - start_total
+        print(f"embed() call perf batch={len(images)} elapsed={elapsed_embed:.3f}s")
+
+        await model.astop()
+        return elapsed_total
+
 
 @app.local_entrypoint()
 def backbone(expname:str=''):
-    st=clock()
+    st=time.time()
 
     # Init the model inference app
     embedder = InfinityModel()
-    startup_dur = clock() - st
+    startup_dur = time.time() - st
     print(f"Took {startup_dur}s to start Infinity Engine.")
     
     # Catalog data
@@ -121,10 +153,9 @@ def backbone(expname:str=''):
         throughputs.append(thru_put)
     print(throughputs[0])
     # Time it!
-    total_duration = clock() - st
+    total_duration = time.time() - st
 
     total_embed_time = sum(throughputs)
-    total_throughput = n_ims / total_embed_time
 
     # Log
     if n_ims>0:
@@ -135,17 +166,5 @@ def backbone(expname:str=''):
             f"\tEmbedding-only throughput (avg):\t{total_embed_time:.2f} im/s\n"
         )
 
-        # append to the file (newline already in log_msg)
-        with open(local_logfile, "a", encoding="utf-8") as outlog:
-            outlog.write(log_msg)
-
-        csv_exists = CSV_FILE.exists()
-        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if not csv_exists:
-                # write header
-                writer.writerow(["batch_size", "concurrency", "n_images", 'total_time', 'total_embed_time', 'max_containers', 'total_thru_put'])
-            # write your row
-            writer.writerow([batch_size, max_concurrency, n_ims, total_duration, total_embed_time, max_containers, n_ims/total_duration])
-    # Store the codes (?)
+        print(log_msg)
 
